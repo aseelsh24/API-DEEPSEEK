@@ -2,6 +2,8 @@ import os
 import re
 import time
 import html
+import json
+import asyncio
 import threading
 from typing import Optional, Dict, Tuple, List
 
@@ -10,6 +12,7 @@ import httpx
 from Crypto.Cipher import AES
 
 from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # -------------------------
@@ -25,6 +28,9 @@ API_KEY: Optional[str] = os.getenv("API_KEY", "20262025")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "DeepSeek-V3")
+
+# هذا مهم ل set_webhook
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()  # مثال: https://api-deepseek-1.onrender.com
 
 SESSION_TTL_SECONDS = 600
 REQUEST_TIMEOUT_SECONDS = 60
@@ -62,7 +68,6 @@ _session_created_at: float = 0.0
 # حفظ نموذج لكل Chat في تيليجرام
 _chat_models: Dict[int, str] = {}
 
-
 # -------------------------
 # Schemas
 # -------------------------
@@ -70,14 +75,12 @@ class ChatReq(BaseModel):
     question: str
     model: Optional[str] = None
 
-
 # -------------------------
 # Helpers
 # -------------------------
 def log(msg: str):
     if DEBUG:
         print(msg, flush=True)
-
 
 def clean_html_response(text: str) -> str:
     """
@@ -95,14 +98,14 @@ def clean_html_response(text: str) -> str:
     # remove other html tags
     text = re.sub(r"<[^>]+>", "", text)
 
-    # fix odd spaced tags that appear sometimes like: </ DeepSeek-V3.
-    text = text.replace("</ ", "</")
+    # تنظيف إضافي لمشاكل ظهرت عندك:
+    # مثل: </ DeepSeek-V3.  أو  < /br>
+    text = text.replace("< /", "</").replace("</ ", "</").replace("<br />", "\n")
 
     # collapse excessive whitespace
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
     return text
-
 
 def _extract_challenge_values(html_text: str) -> Tuple[bytes, bytes, bytes]:
     matches = re.findall(r'toNumbers\("([a-f0-9]+)"\)', html_text, flags=re.IGNORECASE)
@@ -112,7 +115,6 @@ def _extract_challenge_values(html_text: str) -> Tuple[bytes, bytes, bytes]:
     iv = bytes.fromhex(matches[1])
     data = bytes.fromhex(matches[2])
     return key, iv, data
-
 
 def _build_session() -> requests.Session:
     s = requests.Session()
@@ -129,7 +131,6 @@ def _build_session() -> requests.Session:
     time.sleep(0.2)
     return s
 
-
 def _get_session() -> requests.Session:
     global _session, _session_created_at
     with _lock:
@@ -139,10 +140,8 @@ def _get_session() -> requests.Session:
             _session_created_at = now
         return _session
 
-
 def _post_chat(session: requests.Session, model: str, question: str) -> requests.Response:
     payload = {"question": question, "model": model}
-
     log(f"DEBUG_PAYLOAD: {payload}")
 
     r = session.post(
@@ -151,14 +150,10 @@ def _post_chat(session: requests.Session, model: str, question: str) -> requests
         data=payload,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
-
-    # ensure utf-8 to reduce ��
     r.encoding = "utf-8"
     return r
 
-
 def _parse_answer(html_text: str) -> str:
-    # محاولة التقاط الرد من div
     m = re.search(
         r'<div class="response-content">(.*?)</div>',
         html_text,
@@ -166,15 +161,9 @@ def _parse_answer(html_text: str) -> str:
     )
     if m:
         return m.group(1).strip()
-
-    # لو رجعت صفحة HTML كاملة (فشل) نرجع فارغ
     return ""
 
-
 def _extract_form_info(html_text: str) -> Dict[str, object]:
-    """
-    Debug: يحاول يقرأ أسماء حقول الفورم لو رجعت الصفحة الرئيسية بدل الرد.
-    """
     info: Dict[str, object] = {"form_action": "", "field_names": [], "select_names": []}
 
     form = re.search(r"<form[^>]*>", html_text, flags=re.IGNORECASE)
@@ -191,6 +180,17 @@ def _extract_form_info(html_text: str) -> Dict[str, object]:
     info["select_names"] = sorted(list(set(selects)))
     return info
 
+async def safe_read_update(request: Request) -> dict:
+    """
+    قراءة آمنة للـ JSON داخل webhook (تتجنب JSONDecodeError)
+    """
+    body = await request.body()
+    if not body:
+        return {}
+    try:
+        return json.loads(body.decode("utf-8", errors="ignore"))
+    except json.JSONDecodeError:
+        return {}
 
 # -------------------------
 # API endpoints
@@ -198,7 +198,6 @@ def _extract_form_info(html_text: str) -> Dict[str, object]:
 @app.get("/health")
 def health():
     return {"ok": True}
-
 
 @app.post("/chat")
 def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
@@ -209,7 +208,6 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
 
-    # model required by the upstream site
     model = (req.model or "").strip() or DEFAULT_MODEL
 
     session = _get_session()
@@ -218,7 +216,6 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
         r = _post_chat(session, model, question)
         r.raise_for_status()
     except Exception:
-        # refresh session and retry once
         with _lock:
             global _session
             _session = None
@@ -226,15 +223,12 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
         r = _post_chat(session, model, question)
         r.raise_for_status()
 
-    # Debug snippet
     if DEBUG:
-        snippet = r.text[:500]
-        log("DEBUG_RESPONSE_SNIPPET:\n" + snippet)
+        log("DEBUG_RESPONSE_SNIPPET:\n" + r.text[:500])
 
     answer_raw = _parse_answer(r.text)
     answer = clean_html_response(answer_raw)
 
-    # لو رجعت الصفحة الرئيسية بدل الرد
     note = ""
     form_info = None
     if not answer:
@@ -243,54 +237,50 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
         if DEBUG:
             log(f"DEBUG_FORM_INFO: {form_info}")
 
-    resp = {
-        "model": model,
-        "question": question,
-        "answer": answer,
-    }
+    resp = {"model": model, "question": question, "answer": answer}
     if note:
         resp["note"] = note
     if form_info:
         resp["debug_form_info"] = form_info
-
     return resp
 
-
 # -------------------------
-# Telegram webhook section
+# Telegram helpers
 # -------------------------
 async def tg_send(chat_id: int, text: str):
     if not TELEGRAM_BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
+    payload = {"chat_id": chat_id, "text": clean_html_response(text)}
     async with httpx.AsyncClient(timeout=30) as client:
         await client.post(url, json=payload)
-
 
 def get_chat_model(chat_id: int) -> str:
     return _chat_models.get(chat_id, DEFAULT_MODEL)
 
-
 def set_chat_model(chat_id: int, model: str):
     _chat_models[chat_id] = model
 
-
-@app.post("/tg/webhook")
-async def tg_webhook(request: Request):
+# -------------------------
+# Telegram webhook (مسارين لنفس الدالة)
+# -------------------------
+async def _handle_telegram_update(request: Request):
     if not TELEGRAM_BOT_TOKEN:
         raise HTTPException(status_code=500, detail="TELEGRAM_BOT_TOKEN missing")
 
-    update = await request.json()
-    message = update.get("message") or update.get("edited_message")
+    update = await safe_read_update(request)
+    if not update:
+        return JSONResponse({"ok": True})
+
+    message = update.get("message") or update.get("edited_message") or {}
     if not message:
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     chat_id = (message.get("chat") or {}).get("id")
     text = (message.get("text") or "").strip()
 
-    if not chat_id or not text:
-        return {"ok": True}
+    if not chat_id:
+        return JSONResponse({"ok": True})
 
     # Commands
     if text in ("/start", "/help"):
@@ -304,54 +294,88 @@ async def tg_webhook(request: Request):
             "/reset_model - رجوع للافتراضي\n"
             "/whoami - عرض النموذج الحالي"
         )
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     if text == "/models":
         await tg_send(chat_id, "النماذج المتاحة:\n" + "\n".join(f"- {m}" for m in AVAILABLE_MODELS))
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     if text == "/whoami":
         await tg_send(chat_id, f"النموذج الحالي: {get_chat_model(chat_id)}")
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     if text == "/reset_model":
         set_chat_model(chat_id, DEFAULT_MODEL)
         await tg_send(chat_id, f"تم الرجوع إلى النموذج الافتراضي: {DEFAULT_MODEL}")
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     if text.startswith("/model"):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
             await tg_send(chat_id, "اكتب اسم النموذج بعد الأمر:\nمثال: /model DeepSeek-V3")
-            return {"ok": True}
+            return JSONResponse({"ok": True})
 
         chosen = parts[1].strip()
         if chosen not in AVAILABLE_MODELS:
-            await tg_send(
-                chat_id,
-                "هذا النموذج غير موجود ضمن القائمة.\nاستخدم /models لعرض النماذج المتاحة."
-            )
-            return {"ok": True}
+            await tg_send(chat_id, "هذا النموذج غير موجود ضمن القائمة.\nاستخدم /models لعرض النماذج المتاحة.")
+            return JSONResponse({"ok": True})
 
         set_chat_model(chat_id, chosen)
         await tg_send(chat_id, f"تم تعيين النموذج إلى: {chosen}")
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
-    # Normal text => ask upstream
+    # لو المستخدم أرسل نص فارغ
+    if not text:
+        return JSONResponse({"ok": True})
+
+    # Normal text => ask upstream (بشكل غير حاجز للـ async)
     model = get_chat_model(chat_id)
-    try:
+
+    def _blocking_call():
         req = ChatReq(question=text, model=model)
         res = chat(req, x_api_key=API_KEY)
-        answer = res.get("answer") or "لا يوجد رد."
+        return res.get("answer") or "لا يوجد رد."
 
-        # تنظيف احتياطي إضافي
+    try:
+        answer = await asyncio.to_thread(_blocking_call)
         answer = clean_html_response(answer)
     except Exception:
         answer = "حصل خطأ أثناء المعالجة. جرّب مرة أخرى."
 
-    # Telegram limit ~4096 chars
     if len(answer) > 4000:
         answer = answer[:4000] + "…"
 
     await tg_send(chat_id, answer)
-    return {"ok": True}
+    return JSONResponse({"ok": True})
+
+@app.post("/tg/webhook")
+async def tg_webhook(request: Request):
+    return await _handle_telegram_update(request)
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    return await _handle_telegram_update(request)
+
+# -------------------------
+# Set Telegram Webhook
+# -------------------------
+@app.post("/telegram/set_webhook")
+async def telegram_set_webhook():
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN"}
+
+    base = PUBLIC_BASE_URL
+    if not base:
+        return {"ok": False, "error": "Missing PUBLIC_BASE_URL (e.g. https://api-deepseek-1.onrender.com)"}
+
+    webhook_url = f"{base.rstrip('/')}/telegram/webhook"
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, json={"url": webhook_url})
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text}
+
+    return {"ok": True, "webhook": webhook_url, "telegram": data}
