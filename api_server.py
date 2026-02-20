@@ -76,6 +76,7 @@ def _get_session() -> requests.Session:
 
 def _post_chat(session: requests.Session, model: str, question: str) -> requests.Response:
     payload = {"question": question, "model": model}
+    print("DEBUG_PAYLOAD:", payload)
     return session.post(
         CHAT_URL,
         params={"i": "1"},
