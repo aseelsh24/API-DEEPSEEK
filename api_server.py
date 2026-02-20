@@ -90,19 +90,12 @@ def _post_chat(session: requests.Session, model: Optional[str], question: str) -
     )
 
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
 @app.post("/chat")
 def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     if API_KEY is not None and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    if not req.model.strip():
-        raise HTTPException(status_code=400, detail="model is required")
-
+    # ✅ لا نطلب model
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
 
@@ -128,7 +121,7 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     answer = m.group(1).strip() if m else ""
 
     return {
-        "model": req.model,
+        "model": (req.model or "").strip(),
         "question": req.question,
         "answer": answer,
     }
@@ -170,7 +163,7 @@ async def tg_webhook(request: Request):
 
     # نستخدم نفس منطق /chat (بدون HTTP داخلي)
     try:
-        req = ChatReq(model=DEFAULT_MODEL, question=text)
+        req = ChatReq(question=text)
         res = chat(req, x_api_key=API_KEY)
         answer = res.get("answer") or "لا يوجد رد."
     except Exception:
