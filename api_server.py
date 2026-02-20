@@ -2,8 +2,7 @@ import os
 import re
 import time
 import threading
-import html
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, Dict
 
 import requests
 import httpx
@@ -23,13 +22,36 @@ API_KEY: Optional[str] = os.getenv("API_KEY", "20262025")
 
 # تيليجرام
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "DeepSeek-V3")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "DeepSeek-V3")  # خليته V3 لأنه شغال عندك
 
 SESSION_TTL_SECONDS = 600
 REQUEST_TIMEOUT_SECONDS = 60
 
-# Debug (اختياري)
-DEBUG = os.getenv("DEBUG", "0") == "1"
+# قائمة النماذج (حسب اللي ظهر معك)
+AVAILABLE_MODELS = [
+    "DeepSeek-V1",
+    "DeepSeek-V2",
+    "DeepSeek-V2.5",
+    "DeepSeek-V3",
+    "DeepSeek-V3-0324",
+    "DeepSeek-V3.1",
+    "DeepSeek-V3.2",
+    "DeepSeek-R1",
+    "DeepSeek-R1-0528",
+    "DeepSeek-R1-Distill",
+    "DeepSeek-Prover-V1",
+    "DeepSeek-Prover-V1.5",
+    "DeepSeek-Prover-V2",
+    "DeepSeek-VL",
+    "DeepSeek-Coder",
+    "DeepSeek-Coder-V2",
+    "DeepSeek-Coder-6.7B-base",
+    "DeepSeek-Coder-6.7B-instruct",
+]
+
+# تخزين نموذج كل مستخدم (حسب chat_id)
+_user_models: Dict[int, str] = {}
+_user_lock = threading.Lock()
 
 app = FastAPI(title="Local Script API")
 
@@ -43,8 +65,8 @@ class ChatReq(BaseModel):
     model: Optional[str] = None
 
 
-def _extract_challenge_values(html_text: str) -> Tuple[bytes, bytes, bytes]:
-    matches = re.findall(r'toNumbers\("([a-f0-9]+)"\)', html_text, flags=re.IGNORECASE)
+def _extract_challenge_values(html: str) -> tuple[bytes, bytes, bytes]:
+    matches = re.findall(r'toNumbers\("([a-f0-9]+)"\)', html, flags=re.IGNORECASE)
     if len(matches) < 3:
         raise RuntimeError("Challenge values not found in HTML.")
     key = bytes.fromhex(matches[0])
@@ -81,14 +103,10 @@ def _get_session() -> requests.Session:
 
 
 def _post_chat(session: requests.Session, model: str, question: str) -> requests.Response:
-    # ✅ الموقع يحتاج model + question (وأنت لاحظت هذا فعليًا)
-    payload = {
-        "model": model,
-        "question": question,
-    }
+    # ✅ نرسل model دائمًا لأن الموقع غالبًا يحتاجه
+    payload = {"question": question, "model": model}
 
-    if DEBUG:
-        print("DEBUG_PAYLOAD:", payload)
+    print("DEBUG_PAYLOAD:", payload, flush=True)
 
     return session.post(
         CHAT_URL,
@@ -98,47 +116,22 @@ def _post_chat(session: requests.Session, model: str, question: str) -> requests
     )
 
 
-def _clean_answer(text: str) -> str:
-    """
-    - يفك ترميز HTML entities مثل &#039; و &quot;
-    - يحول <br> إلى أسطر جديدة
-    - يشيل أي HTML tags متبقية
-    """
-    if not text:
-        return ""
-
-    text = html.unescape(text)
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"</?[^>]+>", "", text)  # remove any remaining tags
-    return text.strip()
-
-
-def _extract_answer_from_html(page_html: str) -> str:
+def _extract_answer(html: str) -> str:
+    # أحيانًا الرد يكون داخل div.response-content
     m = re.search(
         r'<div class="response-content">(.*?)</div>',
-        page_html,
+        html,
         flags=re.DOTALL | re.IGNORECASE,
     )
-    raw = m.group(1).strip() if m else ""
-    return _clean_answer(raw)
+    if m:
+        return (m.group(1) or "").strip()
 
+    # إذا رجع صفحة HTML كاملة، هذا يعني غالبًا خطأ في الفورم/الموديل
+    if "<!DOCTYPE html" in html or "<html" in html.lower():
+        print("DEBUG_RESPONSE_SNIPPET:\n", html[:600], flush=True)
+        return ""
 
-def _extract_available_models(page_html: str) -> List[str]:
-    # يحاول استخراج الخيارات من <select name="model"> ... <option>...</option>
-    models = re.findall(r"<option[^>]*>\s*([^<]+?)\s*</option>", page_html, flags=re.IGNORECASE)
-    cleaned = []
-    for m in models:
-        val = m.strip()
-        if val and val.lower() not in ("اختر", "choose", "select", "model"):
-            cleaned.append(val)
-    # إزالة التكرار مع الحفاظ على الترتيب
-    seen = set()
-    unique = []
-    for x in cleaned:
-        if x not in seen:
-            seen.add(x)
-            unique.append(x)
-    return unique
+    return ""
 
 
 @app.get("/health")
@@ -154,6 +147,7 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
 
+    # ✅ استخدم الموديل القادم من الطلب أو الافتراضي
     model = (req.model or "").strip() or DEFAULT_MODEL
 
     session = _get_session()
@@ -162,7 +156,7 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
         r = _post_chat(session, model, req.question.strip())
         r.raise_for_status()
     except Exception:
-        # إعادة بناء السيشن عند أي فشل
+        # إعادة بناء السيشن لو حصلت مشكلة
         with _lock:
             global _session
             _session = None
@@ -170,25 +164,13 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
         r = _post_chat(session, model, req.question.strip())
         r.raise_for_status()
 
-    # إذا رجع صفحة رئيسية بدل نتيجة (يحصل لو format غلط أو model غلط)
-    answer = _extract_answer_from_html(r.text)
+    answer = _extract_answer(r.text)
 
-    # لو ما قدرنا نطلع answer، رجّع ملاحظة + موديلات متاحة (لو قدرنا نستخرجها)
-    resp: Dict[str, Any] = {
+    return {
         "model": model,
-        "question": req.question,
+        "question": req.question.strip(),
         "answer": answer,
     }
-
-    if not answer:
-        # Debug snippet في اللوج (اختياري)
-        if DEBUG:
-            print("DEBUG_RESPONSE_SNIPPET:\n", r.text[:500])
-
-        resp["note"] = "Site returned main HTML page (not a chat response). Likely model is required or request format differs."
-        resp["available_models"] = _extract_available_models(r.text)
-
-    return resp
 
 
 # -------------------------
@@ -202,6 +184,33 @@ async def tg_send(chat_id: int, text: str):
     payload = {"chat_id": chat_id, "text": text}
     async with httpx.AsyncClient(timeout=30) as client:
         await client.post(url, json=payload)
+
+
+def _get_user_model(chat_id: int) -> str:
+    with _user_lock:
+        return _user_models.get(chat_id, DEFAULT_MODEL)
+
+
+def _set_user_model(chat_id: int, model: str):
+    with _user_lock:
+        _user_models[chat_id] = model
+
+
+def _reset_user_model(chat_id: int):
+    with _user_lock:
+        if chat_id in _user_models:
+            del _user_models[chat_id]
+
+
+def _format_models_list() -> str:
+    # عرض مرتب
+    lines = ["📌 النماذج المتاحة:"]
+    for m in AVAILABLE_MODELS:
+        lines.append(f"- {m}")
+    lines.append("\n✅ للاختيار: /model DeepSeek-V3")
+    lines.append("✅ لمعرفة الحالي: /model")
+    lines.append("✅ للرجوع للافتراضي: /reset_model")
+    return "\n".join(lines)
 
 
 @app.post("/tg/webhook")
@@ -221,24 +230,53 @@ async def tg_webhook(request: Request):
     if not chat_id or not text:
         return {"ok": True}
 
+    # أوامر عامة
     if text in ("/start", "/help"):
-        await tg_send(chat_id, "أهلًا! اكتب سؤالك وسأرد عليك.")
+        current = _get_user_model(chat_id)
+        await tg_send(
+            chat_id,
+            "أهلًا! 👋\n"
+            "اكتب سؤالك وسأرد عليك.\n\n"
+            f"🔧 النموذج الحالي: {current}\n"
+            "📌 عرض النماذج: /models\n"
+            "✅ تغيير النموذج: /model DeepSeek-V3\n"
+            "♻️ رجوع للافتراضي: /reset_model"
+        )
         return {"ok": True}
 
-    # نستخدم نفس منطق /chat (بدون HTTP داخلي)
+    if text == "/models":
+        await tg_send(chat_id, _format_models_list())
+        return {"ok": True}
+
+    if text == "/model":
+        await tg_send(chat_id, f"🔧 النموذج الحالي لديك: {_get_user_model(chat_id)}")
+        return {"ok": True}
+
+    if text.startswith("/model "):
+        desired = text.replace("/model", "", 1).strip()
+        if desired not in AVAILABLE_MODELS:
+            await tg_send(
+                chat_id,
+                "❌ اسم النموذج غير صحيح.\n\n"
+                "استخدم /models لعرض الأسماء المتاحة."
+            )
+            return {"ok": True}
+
+        _set_user_model(chat_id, desired)
+        await tg_send(chat_id, f"✅ تم تغيير النموذج إلى: {desired}")
+        return {"ok": True}
+
+    if text == "/reset_model":
+        _reset_user_model(chat_id)
+        await tg_send(chat_id, f"♻️ تم الرجوع إلى النموذج الافتراضي: {DEFAULT_MODEL}")
+        return {"ok": True}
+
+    # أي رسالة أخرى: نرسلها للـ /chat باستخدام نموذج المستخدم
     try:
-        req = ChatReq(model=DEFAULT_MODEL, question=text)
+        model = _get_user_model(chat_id)
+        req = ChatReq(question=text, model=model)
         res = chat(req, x_api_key=API_KEY)
-        answer = (res.get("answer") or "").strip()
-
-        if not answer:
-            note = res.get("note") or "لا يوجد رد."
-            models = res.get("available_models") or []
-            if models:
-                answer = f"{note}\n\nAvailable models:\n- " + "\n- ".join(models[:30])
-            else:
-                answer = note
-
+        answer = (res.get("answer") or "").strip() or "لا يوجد رد."
     except Exception:
         answer = "حصل خطأ أثناء المعالجة. جرّب مرة أخرى."
 
