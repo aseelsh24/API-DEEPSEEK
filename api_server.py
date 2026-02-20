@@ -76,11 +76,16 @@ def _get_session() -> requests.Session:
         return _session
 
 
-def _post_chat(session: requests.Session, model: str, question: str) -> requests.Response:
+def _post_chat(session: requests.Session, model: Optional[str], question: str) -> requests.Response:
+    payload = {"question": question}
+    # ✅ تجاهل model بالكامل إذا كان فارغ أو None
+    if model and model.strip():
+        payload["model"] = model.strip()
+
     return session.post(
         CHAT_URL,
         params={"i": "1"},
-        data={"model": model, "question": question},
+        data=payload,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
 
