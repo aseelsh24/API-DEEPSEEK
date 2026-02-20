@@ -104,6 +104,7 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
         r = _post_chat(session, req.model, req.question)
         r.raise_for_status()
         print("DEBUG_RESPONSE_SNIPPET:", r.text[:400])
+        print("DEBUG_RESPONSE_TAIL:", r.text[-400:])
     except Exception:
         with _lock:
             global _session
@@ -112,6 +113,7 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
         r = _post_chat(session, req.model, req.question)
         r.raise_for_status()
         print("DEBUG_RESPONSE_SNIPPET:", r.text[:400])
+        print("DEBUG_RESPONSE_TAIL:", r.text[-400:])
 
     m = re.search(
         r'<div class="response-content">(.*?)</div>',
