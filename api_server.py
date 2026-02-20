@@ -2,7 +2,8 @@ import os
 import re
 import time
 import threading
-from typing import Optional
+import html
+from typing import Optional, List, Dict, Any, Tuple
 
 import requests
 import httpx
@@ -17,15 +18,18 @@ WARMUP_URL = f"{BASE_URL}/index.php?i=1"
 CHAT_URL = f"{BASE_URL}/deepseek.php"
 COOKIE_DOMAIN = "asmodeus.free.nf"
 
+# الأفضل تخزنها في Render Env بدل الكود
 API_KEY: Optional[str] = os.getenv("API_KEY", "20262025")
 
+# تيليجرام
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-
-# خليها من نفس القائمة اللي طلعت لك
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "DeepSeek-V3")
 
 SESSION_TTL_SECONDS = 600
 REQUEST_TIMEOUT_SECONDS = 60
+
+# Debug (اختياري)
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
 app = FastAPI(title="Local Script API")
 
@@ -39,8 +43,8 @@ class ChatReq(BaseModel):
     model: Optional[str] = None
 
 
-def _extract_challenge_values(html: str) -> tuple[bytes, bytes, bytes]:
-    matches = re.findall(r'toNumbers\("([a-f0-9]+)"\)', html, flags=re.IGNORECASE)
+def _extract_challenge_values(html_text: str) -> Tuple[bytes, bytes, bytes]:
+    matches = re.findall(r'toNumbers\("([a-f0-9]+)"\)', html_text, flags=re.IGNORECASE)
     if len(matches) < 3:
         raise RuntimeError("Challenge values not found in HTML.")
     key = bytes.fromhex(matches[0])
@@ -51,14 +55,7 @@ def _extract_challenge_values(html: str) -> tuple[bytes, bytes, bytes]:
 
 def _build_session() -> requests.Session:
     s = requests.Session()
-
-    # هيدرز متصفح أساسية
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-        "Connection": "keep-alive",
-    })
+    s.headers.update({"User-Agent": "Mozilla/5.0 (Android)"})
 
     r = s.get(HOME_URL, timeout=REQUEST_TIMEOUT_SECONDS)
     r.raise_for_status()
@@ -83,81 +80,65 @@ def _get_session() -> requests.Session:
         return _session
 
 
-def _extract_models_from_html(html: str) -> list[str]:
-    models = re.findall(r'<option\s+value="([^"]+)"', html, flags=re.IGNORECASE)
-    out = []
-    for m in models:
-        m = m.strip()
-        if m and m not in out:
-            out.append(m)
-    return out
-
-
-def _extract_form_fields(html: str) -> dict:
-    form_action = ""
-    m_action = re.search(r"<form[^>]*action=['\"]([^'\"]+)['\"]", html, flags=re.IGNORECASE)
-    if m_action:
-        form_action = m_action.group(1)
-
-    names = re.findall(
-        r"<(input|textarea|select)[^>]*name=['\"]([^'\"]+)['\"]",
-        html,
-        flags=re.IGNORECASE,
-    )
-
-    select_names = []
-    for tag, name in names:
-        if tag.lower() == "select" and name not in select_names:
-            select_names.append(name)
-
-    return {
-        "form_action": form_action,
-        "field_names": [n[1] for n in names],
-        "select_names": select_names,
+def _post_chat(session: requests.Session, model: str, question: str) -> requests.Response:
+    # ✅ الموقع يحتاج model + question (وأنت لاحظت هذا فعليًا)
+    payload = {
+        "model": model,
+        "question": question,
     }
 
-
-def _is_main_page(html: str) -> bool:
-    return "<title>مجمع نماذج DeepSeek</title>" in html
-
-
-def _extract_answer(html: str) -> str:
-    # 1) الشكل الذي كنت تستخدمه
-    m = re.search(r'<div class="response-content">(.*?)</div>', html, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-
-    # 2) أحيانًا تكون النتيجة في عنصر آخر
-    m2 = re.search(r'id=["\']response["\']\s*>\s*(.*?)<', html, flags=re.DOTALL | re.IGNORECASE)
-    if m2:
-        return m2.group(1).strip()
-
-    return ""
-
-
-def _post_chat(session: requests.Session, model: str, question: str, ajax: bool = False) -> requests.Response:
-    payload = {"model": model, "question": question}
-    print("DEBUG_PAYLOAD:", payload)
-
-    headers = {
-        # مهم جدًا لبعض المواقع
-        "Referer": CHAT_URL,
-        "Origin": BASE_URL,
-    }
-
-    if ajax:
-        headers.update({
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "*/*",
-        })
+    if DEBUG:
+        print("DEBUG_PAYLOAD:", payload)
 
     return session.post(
         CHAT_URL,
         params={"i": "1"},
         data=payload,
-        headers=headers,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
+
+
+def _clean_answer(text: str) -> str:
+    """
+    - يفك ترميز HTML entities مثل &#039; و &quot;
+    - يحول <br> إلى أسطر جديدة
+    - يشيل أي HTML tags متبقية
+    """
+    if not text:
+        return ""
+
+    text = html.unescape(text)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?[^>]+>", "", text)  # remove any remaining tags
+    return text.strip()
+
+
+def _extract_answer_from_html(page_html: str) -> str:
+    m = re.search(
+        r'<div class="response-content">(.*?)</div>',
+        page_html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    raw = m.group(1).strip() if m else ""
+    return _clean_answer(raw)
+
+
+def _extract_available_models(page_html: str) -> List[str]:
+    # يحاول استخراج الخيارات من <select name="model"> ... <option>...</option>
+    models = re.findall(r"<option[^>]*>\s*([^<]+?)\s*</option>", page_html, flags=re.IGNORECASE)
+    cleaned = []
+    for m in models:
+        val = m.strip()
+        if val and val.lower() not in ("اختر", "choose", "select", "model"):
+            cleaned.append(val)
+    # إزالة التكرار مع الحفاظ على الترتيب
+    seen = set()
+    unique = []
+    for x in cleaned:
+        if x not in seen:
+            seen.add(x)
+            unique.append(x)
+    return unique
 
 
 @app.get("/health")
@@ -170,57 +151,44 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     if API_KEY is not None and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    if not req.question.strip():
+    if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
 
-    model_to_use = (req.model or DEFAULT_MODEL).strip()
-    if not model_to_use:
-        model_to_use = DEFAULT_MODEL
+    model = (req.model or "").strip() or DEFAULT_MODEL
 
     session = _get_session()
 
-    # محاولة 1
     try:
-        r = _post_chat(session, model_to_use, req.question, ajax=False)
+        r = _post_chat(session, model, req.question.strip())
         r.raise_for_status()
     except Exception:
+        # إعادة بناء السيشن عند أي فشل
         with _lock:
             global _session
             _session = None
         session = _get_session()
-        r = _post_chat(session, model_to_use, req.question, ajax=False)
+        r = _post_chat(session, model, req.question.strip())
         r.raise_for_status()
 
-    print("DEBUG_RESPONSE_SNIPPET:", r.text[:250])
+    # إذا رجع صفحة رئيسية بدل نتيجة (يحصل لو format غلط أو model غلط)
+    answer = _extract_answer_from_html(r.text)
 
-    # إذا رجعت الصفحة الرئيسية → جرّب AJAX
-    if _is_main_page(r.text):
-        r2 = _post_chat(session, model_to_use, req.question, ajax=True)
-        print("DEBUG_RESPONSE_SNIPPET_AJAX:", r2.text[:250])
+    # لو ما قدرنا نطلع answer، رجّع ملاحظة + موديلات متاحة (لو قدرنا نستخرجها)
+    resp: Dict[str, Any] = {
+        "model": model,
+        "question": req.question,
+        "answer": answer,
+    }
 
-        # لو AJAX جاب جواب
-        answer2 = _extract_answer(r2.text)
-        if answer2:
-            return {"model": model_to_use, "question": req.question, "answer": answer2}
+    if not answer:
+        # Debug snippet في اللوج (اختياري)
+        if DEBUG:
+            print("DEBUG_RESPONSE_SNIPPET:\n", r.text[:500])
 
-        # لو برضه رجعت Main Page
-        if _is_main_page(r2.text):
-            models = _extract_models_from_html(r2.text)
-            info = _extract_form_fields(r2.text)
-            print("DEBUG_FORM_INFO:", info)
+        resp["note"] = "Site returned main HTML page (not a chat response). Likely model is required or request format differs."
+        resp["available_models"] = _extract_available_models(r.text)
 
-            return {
-                "model": model_to_use,
-                "question": req.question,
-                "answer": "",
-                "note": "Still getting the main HTML page. The site may require a different endpoint (AJAX/fetch) inside JS or extra hidden fields.",
-                "available_models": models[:50],
-                "form_info": info,
-            }
-
-    # لو ليست main page: حاول استخراج جواب من المحاولة الأولى
-    answer = _extract_answer(r.text)
-    return {"model": model_to_use, "question": req.question, "answer": answer}
+    return resp
 
 
 # -------------------------
@@ -241,10 +209,7 @@ async def tg_webhook(request: Request):
     if not TELEGRAM_BOT_TOKEN:
         raise HTTPException(status_code=500, detail="TELEGRAM_BOT_TOKEN missing")
 
-    try:
-        update = await request.json()
-    except Exception:
-        return {"ok": True}
+    update = await request.json()
 
     message = update.get("message") or update.get("edited_message")
     if not message:
@@ -260,15 +225,27 @@ async def tg_webhook(request: Request):
         await tg_send(chat_id, "أهلًا! اكتب سؤالك وسأرد عليك.")
         return {"ok": True}
 
+    # نستخدم نفس منطق /chat (بدون HTTP داخلي)
     try:
-        req = ChatReq(question=text)
+        req = ChatReq(model=DEFAULT_MODEL, question=text)
         res = chat(req, x_api_key=API_KEY)
-        answer = res.get("answer") or res.get("note") or "لا يوجد رد."
+        answer = (res.get("answer") or "").strip()
+
+        if not answer:
+            note = res.get("note") or "لا يوجد رد."
+            models = res.get("available_models") or []
+            if models:
+                answer = f"{note}\n\nAvailable models:\n- " + "\n- ".join(models[:30])
+            else:
+                answer = note
+
     except Exception:
         answer = "حصل خطأ أثناء المعالجة. جرّب مرة أخرى."
 
+    # حد تيليجرام ~4096 حرف
     if len(answer) > 4000:
         answer = answer[:4000] + "…"
 
     await tg_send(chat_id, answer)
     return {"ok": True}
+```0
