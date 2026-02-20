@@ -88,8 +88,19 @@ def _post_chat(session: requests.Session, model: Optional[str], question: str) -
         data=payload,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
+    
+def _extract_models_from_html(html: str) -> list[str]:
+    # يلتقط القيم داخل option value=""
+    models = re.findall(r'<option\s+value="([^"]+)"', html, flags=re.IGNORECASE)
+    # تنظيف وتفريد
+    cleaned = []
+    for m in models:
+        m = m.strip()
+        if m and m not in cleaned:
+            cleaned.append(m)
+    return cleaned
 
-
+@app.post("/chat")
 @app.post("/chat")
 def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     if API_KEY is not None and x_api_key != API_KEY:
@@ -103,8 +114,6 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     try:
         r = _post_chat(session, req.model, req.question)
         r.raise_for_status()
-        print("DEBUG_RESPONSE_SNIPPET:", r.text[:400])
-        print("DEBUG_RESPONSE_TAIL:", r.text[-400:])
     except Exception:
         with _lock:
             global _session
@@ -112,9 +121,22 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
         session = _get_session()
         r = _post_chat(session, req.model, req.question)
         r.raise_for_status()
-        print("DEBUG_RESPONSE_SNIPPET:", r.text[:400])
-        print("DEBUG_RESPONSE_TAIL:", r.text[-400:])
 
+    # ✅ تشخيص مؤقت (اختياري)
+    print("DEBUG_RESPONSE_SNIPPET:", r.text[:200])
+
+    # ✅ إذا رجع صفحة الواجهة بدل جواب
+    if "<title>مجمع نماذج DeepSeek</title>" in r.text:
+        models = _extract_models_from_html(r.text)
+        return {
+            "model": (req.model or "").strip(),
+            "question": req.question,
+            "answer": "",
+            "note": "Site returned main HTML page (not a chat response). Likely model is required or request format differs.",
+            "available_models": models[:50],
+        }
+
+    # ✅ استخراج الجواب بالطريقة القديمة (سنعدلها لاحقًا إذا احتجنا)
     m = re.search(
         r'<div class="response-content">(.*?)</div>',
         r.text,
