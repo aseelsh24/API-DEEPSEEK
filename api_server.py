@@ -35,8 +35,8 @@ _session_created_at: float = 0.0
 
 
 class ChatReq(BaseModel):
-    model: str
     question: str
+    model: Optional[str] = None
 
 
 def _extract_challenge_values(html: str) -> tuple[bytes, bytes, bytes]:
