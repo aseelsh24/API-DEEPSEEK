@@ -75,8 +75,10 @@ def _get_session() -> requests.Session:
 
 
 def _post_chat(session: requests.Session, model: str, question: str) -> requests.Response:
+    # مبدئيًا نرسل بهذه الصيغة، وبعد ما نعرف form_info قد نغيّر أسماء الحقول
     payload = {"question": question, "model": model}
     print("DEBUG_PAYLOAD:", payload)
+
     return session.post(
         CHAT_URL,
         params={"i": "1"},
@@ -95,6 +97,32 @@ def _extract_models_from_html(html: str) -> list[str]:
     return cleaned
 
 
+def _extract_form_fields(html: str) -> dict:
+    form_action = ""
+    m_action = re.search(r"<form[^>]*action=['\"]([^'\"]+)['\"]", html, flags=re.IGNORECASE)
+    if m_action:
+        form_action = m_action.group(1)
+
+    # كل name= في input/textarea/select
+    names = re.findall(
+        r"<(input|textarea|select)[^>]*name=['\"]([^'\"]+)['\"]",
+        html,
+        flags=re.IGNORECASE
+    )
+
+    # أسماء select (أحيانًا مهم)
+    select_names = []
+    for tag, name in names:
+        if tag.lower() == "select" and name not in select_names:
+            select_names.append(name)
+
+    return {
+        "form_action": form_action,
+        "field_names": [n[1] for n in names],
+        "select_names": select_names,
+    }
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -108,7 +136,6 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
 
-    # ✅ إذا المستخدم ما أرسل model نستخدم DEFAULT_MODEL
     model_to_use = (req.model or DEFAULT_MODEL).strip()
     if not model_to_use:
         model_to_use = "DeepSeek-V3"
@@ -126,24 +153,30 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
         r = _post_chat(session, model_to_use, req.question)
         r.raise_for_status()
 
-    # ✅ إذا رجع صفحة الواجهة بدل جواب
+    # تشخيص سريع (اختياري)
+    print("DEBUG_RESPONSE_SNIPPET:", r.text[:200])
+
+    # إذا رجع صفحة الواجهة بدل جواب
     if "<title>مجمع نماذج DeepSeek</title>" in r.text:
         models = _extract_models_from_html(r.text)
+        info = _extract_form_fields(r.text)
+        print("DEBUG_FORM_INFO:", info)
+
         return {
             "model": model_to_use,
             "question": req.question,
             "answer": "",
-            "note": "Site returned main HTML page (not a chat response). Check request format or model.",
+            "note": "Site returned main HTML page. Need correct field names or correct endpoint (form_action/ajax).",
             "available_models": models[:50],
+            "form_info": info,
         }
 
-    # استخراج الجواب
+    # محاولة استخراج الجواب (قد نعدلها لاحقًا حسب شكل الرد)
     m = re.search(
         r'<div class="response-content">(.*?)</div>',
         r.text,
         flags=re.DOTALL | re.IGNORECASE,
     )
-
     answer = m.group(1).strip() if m else ""
 
     return {
@@ -171,7 +204,6 @@ async def tg_webhook(request: Request):
     if not TELEGRAM_BOT_TOKEN:
         raise HTTPException(status_code=500, detail="TELEGRAM_BOT_TOKEN missing")
 
-    # ✅ حتى لا يعطي 500 إذا جاء طلب غير JSON
     try:
         update = await request.json()
     except Exception:
@@ -191,8 +223,8 @@ async def tg_webhook(request: Request):
         await tg_send(chat_id, "أهلًا! اكتب سؤالك وسأرد عليك.")
         return {"ok": True}
 
-    # ✅ نرسل السؤال فقط، و /chat يختار DEFAULT_MODEL تلقائيًا
     try:
+        # نرسل السؤال فقط، و /chat يختار DEFAULT_MODEL تلقائيًا
         req = ChatReq(question=text)
         res = chat(req, x_api_key=API_KEY)
         answer = res.get("answer") or "لا يوجد رد."
