@@ -248,4 +248,3 @@ async def tg_webhook(request: Request):
 
     await tg_send(chat_id, answer)
     return {"ok": True}
-```0
