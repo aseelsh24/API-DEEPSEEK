@@ -1,12 +1,14 @@
+import os
 import re
 import time
 import threading
 from typing import Optional
 
 import requests
+import httpx
 from Crypto.Cipher import AES
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 
 BASE_URL = "https://asmodeus.free.nf"
@@ -15,7 +17,12 @@ WARMUP_URL = f"{BASE_URL}/index.php?i=1"
 CHAT_URL = f"{BASE_URL}/deepseek.php"
 COOKIE_DOMAIN = "asmodeus.free.nf"
 
-API_KEY: Optional[str] = "20262025"
+# الأفضل تخزنها في Render Env بدل الكود
+API_KEY: Optional[str] = os.getenv("API_KEY", "20262025")
+
+# تيليجرام
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "deepseek-chat")
 
 SESSION_TTL_SECONDS = 600
 REQUEST_TIMEOUT_SECONDS = 60
@@ -120,3 +127,53 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
         "question": req.question,
         "answer": answer,
     }
+
+
+# -------------------------
+# Telegram webhook section
+# -------------------------
+
+async def tg_send(chat_id: int, text: str):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    async with httpx.AsyncClient(timeout=30) as client:
+        await client.post(url, json=payload)
+
+
+@app.post("/tg/webhook")
+async def tg_webhook(request: Request):
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="TELEGRAM_BOT_TOKEN missing")
+
+    update = await request.json()
+
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        return {"ok": True}
+
+    chat_id = (message.get("chat") or {}).get("id")
+    text = (message.get("text") or "").strip()
+
+    if not chat_id or not text:
+        return {"ok": True}
+
+    if text in ("/start", "/help"):
+        await tg_send(chat_id, "أهلًا! اكتب سؤالك وسأرد عليك.")
+        return {"ok": True}
+
+    # نستخدم نفس منطق /chat (بدون HTTP داخلي)
+    try:
+        req = ChatReq(model=DEFAULT_MODEL, question=text)
+        res = chat(req, x_api_key=API_KEY)
+        answer = res.get("answer") or "لا يوجد رد."
+    except Exception:
+        answer = "حصل خطأ أثناء المعالجة. جرّب مرة أخرى."
+
+    # حد تيليجرام ~4096 حرف
+    if len(answer) > 4000:
+        answer = answer[:4000] + "…"
+
+    await tg_send(chat_id, answer)
+    return {"ok": True}
