@@ -95,16 +95,15 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     if API_KEY is not None and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    # ✅ لا نطلب model
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
 
     session = _get_session()
 
     try:
-    r = _post_chat(session, req.model, req.question)
-    r.raise_for_status()
-    print("DEBUG_RESPONSE_SNIPPET:", r.text[:400])
+        r = _post_chat(session, req.model, req.question)
+        r.raise_for_status()
+        print("DEBUG_RESPONSE_SNIPPET:", r.text[:400])
     except Exception:
         with _lock:
             global _session
@@ -112,7 +111,8 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
         session = _get_session()
         r = _post_chat(session, req.model, req.question)
         r.raise_for_status()
-print("DEBUG_RESPONSE_SNIPPET:", r.text[:400])
+        print("DEBUG_RESPONSE_SNIPPET:", r.text[:400])
+
     m = re.search(
         r'<div class="response-content">(.*?)</div>',
         r.text,
@@ -126,7 +126,6 @@ print("DEBUG_RESPONSE_SNIPPET:", r.text[:400])
         "question": req.question,
         "answer": answer,
     }
-
 
 # -------------------------
 # Telegram webhook section
