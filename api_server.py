@@ -20,6 +20,8 @@ COOKIE_DOMAIN = "asmodeus.free.nf"
 API_KEY: Optional[str] = os.getenv("API_KEY", "20262025")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+# خليها من نفس القائمة اللي طلعت لك
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "DeepSeek-V3")
 
 SESSION_TTL_SECONDS = 600
@@ -49,7 +51,14 @@ def _extract_challenge_values(html: str) -> tuple[bytes, bytes, bytes]:
 
 def _build_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0 (Android)"})
+
+    # هيدرز متصفح أساسية
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
+    })
 
     r = s.get(HOME_URL, timeout=REQUEST_TIMEOUT_SECONDS)
     r.raise_for_status()
@@ -74,27 +83,14 @@ def _get_session() -> requests.Session:
         return _session
 
 
-def _post_chat(session: requests.Session, model: str, question: str) -> requests.Response:
-    # مبدئيًا نرسل بهذه الصيغة، وبعد ما نعرف form_info قد نغيّر أسماء الحقول
-    payload = {"question": question, "model": model}
-    print("DEBUG_PAYLOAD:", payload)
-
-    return session.post(
-        CHAT_URL,
-        params={"i": "1"},
-        data=payload,
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
-
-
 def _extract_models_from_html(html: str) -> list[str]:
     models = re.findall(r'<option\s+value="([^"]+)"', html, flags=re.IGNORECASE)
-    cleaned = []
+    out = []
     for m in models:
         m = m.strip()
-        if m and m not in cleaned:
-            cleaned.append(m)
-    return cleaned
+        if m and m not in out:
+            out.append(m)
+    return out
 
 
 def _extract_form_fields(html: str) -> dict:
@@ -103,14 +99,12 @@ def _extract_form_fields(html: str) -> dict:
     if m_action:
         form_action = m_action.group(1)
 
-    # كل name= في input/textarea/select
     names = re.findall(
         r"<(input|textarea|select)[^>]*name=['\"]([^'\"]+)['\"]",
         html,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
 
-    # أسماء select (أحيانًا مهم)
     select_names = []
     for tag, name in names:
         if tag.lower() == "select" and name not in select_names:
@@ -121,6 +115,49 @@ def _extract_form_fields(html: str) -> dict:
         "field_names": [n[1] for n in names],
         "select_names": select_names,
     }
+
+
+def _is_main_page(html: str) -> bool:
+    return "<title>مجمع نماذج DeepSeek</title>" in html
+
+
+def _extract_answer(html: str) -> str:
+    # 1) الشكل الذي كنت تستخدمه
+    m = re.search(r'<div class="response-content">(.*?)</div>', html, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # 2) أحيانًا تكون النتيجة في عنصر آخر
+    m2 = re.search(r'id=["\']response["\']\s*>\s*(.*?)<', html, flags=re.DOTALL | re.IGNORECASE)
+    if m2:
+        return m2.group(1).strip()
+
+    return ""
+
+
+def _post_chat(session: requests.Session, model: str, question: str, ajax: bool = False) -> requests.Response:
+    payload = {"model": model, "question": question}
+    print("DEBUG_PAYLOAD:", payload)
+
+    headers = {
+        # مهم جدًا لبعض المواقع
+        "Referer": CHAT_URL,
+        "Origin": BASE_URL,
+    }
+
+    if ajax:
+        headers.update({
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "*/*",
+        })
+
+    return session.post(
+        CHAT_URL,
+        params={"i": "1"},
+        data=payload,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
 
 
 @app.get("/health")
@@ -138,52 +175,52 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
 
     model_to_use = (req.model or DEFAULT_MODEL).strip()
     if not model_to_use:
-        model_to_use = "DeepSeek-V3"
+        model_to_use = DEFAULT_MODEL
 
     session = _get_session()
 
+    # محاولة 1
     try:
-        r = _post_chat(session, model_to_use, req.question)
+        r = _post_chat(session, model_to_use, req.question, ajax=False)
         r.raise_for_status()
     except Exception:
         with _lock:
             global _session
             _session = None
         session = _get_session()
-        r = _post_chat(session, model_to_use, req.question)
+        r = _post_chat(session, model_to_use, req.question, ajax=False)
         r.raise_for_status()
 
-    # تشخيص سريع (اختياري)
-    print("DEBUG_RESPONSE_SNIPPET:", r.text[:200])
+    print("DEBUG_RESPONSE_SNIPPET:", r.text[:250])
 
-    # إذا رجع صفحة الواجهة بدل جواب
-    if "<title>مجمع نماذج DeepSeek</title>" in r.text:
-        models = _extract_models_from_html(r.text)
-        info = _extract_form_fields(r.text)
-        print("DEBUG_FORM_INFO:", info)
+    # إذا رجعت الصفحة الرئيسية → جرّب AJAX
+    if _is_main_page(r.text):
+        r2 = _post_chat(session, model_to_use, req.question, ajax=True)
+        print("DEBUG_RESPONSE_SNIPPET_AJAX:", r2.text[:250])
 
-        return {
-            "model": model_to_use,
-            "question": req.question,
-            "answer": "",
-            "note": "Site returned main HTML page. Need correct field names or correct endpoint (form_action/ajax).",
-            "available_models": models[:50],
-            "form_info": info,
-        }
+        # لو AJAX جاب جواب
+        answer2 = _extract_answer(r2.text)
+        if answer2:
+            return {"model": model_to_use, "question": req.question, "answer": answer2}
 
-    # محاولة استخراج الجواب (قد نعدلها لاحقًا حسب شكل الرد)
-    m = re.search(
-        r'<div class="response-content">(.*?)</div>',
-        r.text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    answer = m.group(1).strip() if m else ""
+        # لو برضه رجعت Main Page
+        if _is_main_page(r2.text):
+            models = _extract_models_from_html(r2.text)
+            info = _extract_form_fields(r2.text)
+            print("DEBUG_FORM_INFO:", info)
 
-    return {
-        "model": model_to_use,
-        "question": req.question,
-        "answer": answer,
-    }
+            return {
+                "model": model_to_use,
+                "question": req.question,
+                "answer": "",
+                "note": "Still getting the main HTML page. The site may require a different endpoint (AJAX/fetch) inside JS or extra hidden fields.",
+                "available_models": models[:50],
+                "form_info": info,
+            }
+
+    # لو ليست main page: حاول استخراج جواب من المحاولة الأولى
+    answer = _extract_answer(r.text)
+    return {"model": model_to_use, "question": req.question, "answer": answer}
 
 
 # -------------------------
@@ -207,7 +244,7 @@ async def tg_webhook(request: Request):
     try:
         update = await request.json()
     except Exception:
-        return {"ok": True, "ignored": "no_json"}
+        return {"ok": True}
 
     message = update.get("message") or update.get("edited_message")
     if not message:
@@ -224,10 +261,9 @@ async def tg_webhook(request: Request):
         return {"ok": True}
 
     try:
-        # نرسل السؤال فقط، و /chat يختار DEFAULT_MODEL تلقائيًا
         req = ChatReq(question=text)
         res = chat(req, x_api_key=API_KEY)
-        answer = res.get("answer") or "لا يوجد رد."
+        answer = res.get("answer") or res.get("note") or "لا يوجد رد."
     except Exception:
         answer = "حصل خطأ أثناء المعالجة. جرّب مرة أخرى."
 
