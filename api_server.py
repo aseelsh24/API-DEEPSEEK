@@ -17,12 +17,10 @@ WARMUP_URL = f"{BASE_URL}/index.php?i=1"
 CHAT_URL = f"{BASE_URL}/deepseek.php"
 COOKIE_DOMAIN = "asmodeus.free.nf"
 
-# الأفضل تخزنها في Render Env بدل الكود
 API_KEY: Optional[str] = os.getenv("API_KEY", "20262025")
 
-# تيليجرام
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "deepseek-chat")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "DeepSeek-V3")
 
 SESSION_TTL_SECONDS = 600
 REQUEST_TIMEOUT_SECONDS = 60
@@ -76,23 +74,18 @@ def _get_session() -> requests.Session:
         return _session
 
 
-def _post_chat(session: requests.Session, model: Optional[str], question: str) -> requests.Response:
-    payload = {"question": question}
-    # ✅ تجاهل model بالكامل إذا كان فارغ أو None
-    if model and model.strip():
-        payload["model"] = model.strip()
-
+def _post_chat(session: requests.Session, model: str, question: str) -> requests.Response:
+    payload = {"question": question, "model": model}
     return session.post(
         CHAT_URL,
         params={"i": "1"},
         data=payload,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
-    
+
+
 def _extract_models_from_html(html: str) -> list[str]:
-    # يلتقط القيم داخل option value=""
     models = re.findall(r'<option\s+value="([^"]+)"', html, flags=re.IGNORECASE)
-    # تنظيف وتفريد
     cleaned = []
     for m in models:
         m = m.strip()
@@ -100,7 +93,12 @@ def _extract_models_from_html(html: str) -> list[str]:
             cleaned.append(m)
     return cleaned
 
-@app.post("/chat")
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 @app.post("/chat")
 def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     if API_KEY is not None and x_api_key != API_KEY:
@@ -109,34 +107,36 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
 
+    # ✅ إذا المستخدم ما أرسل model نستخدم DEFAULT_MODEL
+    model_to_use = (req.model or DEFAULT_MODEL).strip()
+    if not model_to_use:
+        model_to_use = "DeepSeek-V3"
+
     session = _get_session()
 
     try:
-        r = _post_chat(session, req.model, req.question)
+        r = _post_chat(session, model_to_use, req.question)
         r.raise_for_status()
     except Exception:
         with _lock:
             global _session
             _session = None
         session = _get_session()
-        r = _post_chat(session, req.model, req.question)
+        r = _post_chat(session, model_to_use, req.question)
         r.raise_for_status()
-
-    # ✅ تشخيص مؤقت (اختياري)
-    print("DEBUG_RESPONSE_SNIPPET:", r.text[:200])
 
     # ✅ إذا رجع صفحة الواجهة بدل جواب
     if "<title>مجمع نماذج DeepSeek</title>" in r.text:
         models = _extract_models_from_html(r.text)
         return {
-            "model": (req.model or "").strip(),
+            "model": model_to_use,
             "question": req.question,
             "answer": "",
-            "note": "Site returned main HTML page (not a chat response). Likely model is required or request format differs.",
+            "note": "Site returned main HTML page (not a chat response). Check request format or model.",
             "available_models": models[:50],
         }
 
-    # ✅ استخراج الجواب بالطريقة القديمة (سنعدلها لاحقًا إذا احتجنا)
+    # استخراج الجواب
     m = re.search(
         r'<div class="response-content">(.*?)</div>',
         r.text,
@@ -146,10 +146,11 @@ def chat(req: ChatReq, x_api_key: Optional[str] = Header(default=None)):
     answer = m.group(1).strip() if m else ""
 
     return {
-        "model": (req.model or "").strip(),
+        "model": model_to_use,
         "question": req.question,
         "answer": answer,
     }
+
 
 # -------------------------
 # Telegram webhook section
@@ -169,7 +170,11 @@ async def tg_webhook(request: Request):
     if not TELEGRAM_BOT_TOKEN:
         raise HTTPException(status_code=500, detail="TELEGRAM_BOT_TOKEN missing")
 
-    update = await request.json()
+    # ✅ حتى لا يعطي 500 إذا جاء طلب غير JSON
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True, "ignored": "no_json"}
 
     message = update.get("message") or update.get("edited_message")
     if not message:
@@ -185,7 +190,7 @@ async def tg_webhook(request: Request):
         await tg_send(chat_id, "أهلًا! اكتب سؤالك وسأرد عليك.")
         return {"ok": True}
 
-    # نستخدم نفس منطق /chat (بدون HTTP داخلي)
+    # ✅ نرسل السؤال فقط، و /chat يختار DEFAULT_MODEL تلقائيًا
     try:
         req = ChatReq(question=text)
         res = chat(req, x_api_key=API_KEY)
@@ -193,7 +198,6 @@ async def tg_webhook(request: Request):
     except Exception:
         answer = "حصل خطأ أثناء المعالجة. جرّب مرة أخرى."
 
-    # حد تيليجرام ~4096 حرف
     if len(answer) > 4000:
         answer = answer[:4000] + "…"
 
